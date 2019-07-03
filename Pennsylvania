@@ -1,0 +1,1223 @@
+#Script to create a collection of csv tables with 
+##data from the shale gas wells production and waste reports of the PA DEP
+###all wells in rows and columns showing selected data per reporting period 
+#written by Cristina Madrid : crismadlop@gmail.com
+#November 2018
+
+#Methane emission estimation are being checked
+
+library(dplyr)
+library(reshape2)
+library (lubridate)
+library(compare)
+library (ggplot2)
+library(gridExtra)
+library(ggthemes)
+library (GGally)
+library(dlnm)
+library(forcats)
+library(RColorBrewer)
+library(ggmosaic)
+library(cowplot)
+
+
+#Select Working Directory####
+
+InDirYear<- 
+InDirSem<- 
+InDirMonth<- 
+InDirWaste<-
+ExitDir<-
+PicDir<- 
+GasDir<-
+
+#ProdDB can be substituted for a selection of wells
+
+#Manipulating DB####
+Prod_DB<-read.csv(paste0(ExitDir,"/Prod_DB.csv"))
+Prod_DB[is.na(Prod_DB)] <- 0
+
+Prod_DBB<-Prod_DB [!duplicated(Prod_DB[c(2,3)]),]
+
+
+#Extracting well permit with Coordinates##
+Prod_DBB<-Prod_DBB [with(Prod_DBB, order(ï..Well_Permit_Num)), ]
+InventoryDB <- Prod_DBB[match(unique(Prod_DBB$ï..Well_Permit_Num), Prod_DBB$ï..Well_Permit_Num),]
+Unconv_Inventory<-InventoryDB[InventoryDB$Unconventional=="Yes",c(2,8,17:24)]
+write.csv(Unconv_Inventory, paste0(ExitDir,"/Well_Unconv_Inventory.csv"))
+
+#In QGIS make a sparial joint I created the geo inventor####
+
+Geo_Inventory<-read.csv(paste0(ExitDir,"/Well_Unconv_Inventory_Geo.csv"))
+
+#joining Geo inventory with Prod DB
+names(Geo_Inventory)[2]<-"ï..Well_Permit_Num"
+Geo_Prod_DBB<-merge(Prod_DBB, Geo_Inventory[, c(2,16,17,19,20)],
+               by = "ï..Well_Permit_Num")
+
+#Cleaning DB
+Prod_DB1<-Geo_Prod_DBB %>%
+  mutate (Year = lubridate::year(as.Date(
+    Production_Period_End_Date, "%m/%d/%Y")))%>%
+  mutate (SPUDYear = lubridate::year(as.Date(Spud_Date, "%m/%d/%Y")))%>%
+    mutate (ï..Well_Permit_Num = as.factor(ï..Well_Permit_Num))%>%
+    mutate (DB_Type = as.factor(DB_Type))%>%
+    mutate (Gas_Quantity = gsub (",", "", Gas_Quantity))%>%
+  mutate (Gas_Quantity = as.numeric(Gas_Quantity))%>%
+  mutate (Gas_Production_Days = as.numeric(Gas_Production_Days))%>%
+  mutate (Oil_Production_Days = as.numeric(Oil_Production_Days))%>%
+  mutate (Oil_Quantity = gsub (",", "", Oil_Quantity))%>%
+  mutate (Oil_Quantity = as.numeric(Oil_Quantity))%>%
+  mutate (Depth_m = as.numeric(-Depth)*0.3048)#coefficient ft to m from google
+
+  #removing NA###
+Prod_DB1[is.na(Prod_DB1)] <- 0
+
+    
+
+str(Prod_DB1)
+
+
+#Adding Water data####
+WasteDB<-read.csv(paste0(ExitDir,"/WasteDB.csv"))
+WasteDB[is.na(WasteDB)] <- 0
+
+
+names(WasteDB)[2]<-"ï..Well_Permit_Num"
+names(WasteDB)[45]<-"Production_Period_End_Date"
+
+#Adding methane data####
+HighCompletionMethane<-17*1000000#grams per completion
+LowCompletionMethane<-0.01*1000000#grams per completion
+HighUnloadingMethane<-3.7*1000000#grams per unloading (once a week in production, more in decay)
+LowUnloadingMethane<-0.02*1000000#grams per unloading (once a week in production, more in decay)
+HighProductionMethane<-5.9#grams per minute per machine 
+LowProductionMethane<-1.7#grams per minute per machine 
+
+
+
+#Cleaning DB
+Waste_DB1<-WasteDB %>%
+    subset (UNCONVENTIONAL=="Yes")%>%
+    select (ï..Well_Permit_Num,Production_Period_End_Date, 
+             WASTE_TYPE, WASTE_QUANTITY, UNITS, DISPOSAL_METHOD)%>%
+    mutate (WASTE_TYPE = as.factor(WASTE_TYPE))%>%
+    mutate (DISPOSAL_METHOD = as.factor(DISPOSAL_METHOD))%>%
+    mutate (WASTE_QUANTITY = gsub (",", "", WASTE_QUANTITY))%>%
+    mutate (WASTE_QUANTITY = as.numeric(WASTE_QUANTITY))
+
+#transforming DB waste type in columns
+Waste_DB2<-melt(Waste_DB1, id=c("ï..Well_Permit_Num","Production_Period_End_Date", 
+                           "DISPOSAL_METHOD", "WASTE_TYPE", "UNITS"),
+            measure.vars = "WASTE_QUANTITY")%>%
+    dcast(ï..Well_Permit_Num + Production_Period_End_Date ~ UNITS, sum)
+
+               
+
+
+#Defining coeficients translation####
+#sourced from http://agnatural.pt/documentos/ver/natural-gas-conversion-guide_cb4f0ccd80ccaf88ca5ec336a38600867db5aaf1.pdf
+BOE2cf<-4.989
+BOE2MMBTU<-5.8
+cf2BTU<-1/1037 #https://www.eia.gov/tools/faqs/faq.php?id=45&t=8
+BTU2cf<-1037 #https://www.eia.gov/tools/faqs/faq.php?id=45&t=8
+Cf2cm<-0.0283168 #google
+cm2MJ<-37 #https://m.convert-me.com/en/convert/energy/cmsgas.html?u=cmsgas&v=1
+feet2meter<-0.3048 #googlr
+Barrel2cm<-0.1173478 #https://www.metric-conversions.org/volume/us-federal-barrels-to-cubic-meters.htm?val=1
+
+
+#Adding gas price data, source in Dollars per Million Btu####
+#henry hub prices in dollar per million BTU
+
+GasPrices<-read.csv(paste0(GasDir, "/NGPrices.csv"), 
+                    colClasses = c("factor", rep("character",10 )),
+                    dec = ".")%>%
+  select (-X)%>%
+  mutate (Year = lubridate::year(as.Date(
+    Date, "%Y-%m-%d")))%>%
+  mutate (Citigate = as.numeric(Citigate))%>%
+  mutate (Industrial = as.numeric(Industrial))%>%
+  mutate (Pipeline = as.numeric(Pipeline))%>%
+  mutate (Electric.Power = as.numeric(Electric.Power))%>%
+  mutate (Wellhead = as.numeric(Wellhead))%>%
+  mutate (Residential = as.numeric(Residential))%>%
+  mutate (Commercial = as.numeric(Commercial))%>%
+  mutate (Henry.Hub = as.numeric(Henry.Hub))%>%
+  mutate (Futures1 = as.numeric(Futures1))%>%
+  mutate (Henry.Hub_Scf = Henry.Hub*cf2BTU)%>%
+  select (-Date)
+
+GasPrices[is.na(GasPrices)] <- 0
+
+
+GasCosts<-read.csv(paste0(ExitDir, "/Tabla Costes Well IHS.csv"), 
+                              colClasses = c("factor", rep("numeric",15 )),
+                              dec = ".")
+names(GasCosts)[1]<-"Zone_Name"
+
+#1.2.Merging DB with waste, price and cost data####
+Prod_DB1.2<-merge(Prod_DB1, GasPrices[,c(1,10,11)])%>%
+    merge(GasCosts,  by = "Zone_Name")%>%
+    filter(Unconventional =="Yes") %>%
+    merge(Waste_DB2, by = c("ï..Well_Permit_Num", "Production_Period_End_Date"), 
+          all.x=TRUE)
+
+
+#1.3.Estimating cummulative sum of days in production and gas produced####
+#ordering the Prod DB
+Prod_DB1.3<-Prod_DB1.2 %>%
+    mutate (Production_Period_Start_Date = 
+                               as.Date(Production_Period_Start_Date, "%m/%d/%Y")) %>%
+    mutate (Production_Period_End_Date = 
+                as.Date(Production_Period_End_Date, "%m/%d/%Y")) %>%
+    mutate (Spud_Date = as.Date(Spud_Date, "%m/%d/%Y")) 
+
+Prod_DB1.3<-Prod_DB1.3 [!duplicated(Prod_DB1.3[c(3,5)]),]
+
+Prod_DB1.3<-Prod_DB1.3[with(Prod_DB1.3, order(Prod_DB1.3$Production_Period_End_Date,
+                                              Prod_DB1.3$ï..Well_Permit_Num )), ]
+
+#****calculating real SPUD in a vector of first appearances####
+FirstID<-Prod_DB1.3[!duplicated(Prod_DB1.3$ï..Well_Permit_Num), ]%>%
+    mutate(RealSPUD  = if_else ((Spud_Date - Production_Period_End_Date)>0,
+                                (Production_Period_End_Date - Gas_Production_Days - 40), 
+                                (Spud_Date) ))%>%
+    select (ï..Well_Permit_Num, RealSPUD)
+
+#****Adding Age Data####
+Prod_DB1.3.1<-merge(Prod_DB1.3, FirstID, by ="ï..Well_Permit_Num")%>%
+    mutate (Age = Production_Period_End_Date - RealSPUD) %>%
+    mutate (Age = as.numeric(Age)) 
+
+Prod_DB1.3.1<-Prod_DB1.3.1[with(Prod_DB1.3, order(ï..Well_Permit_Num,Production_Period_End_Date)), ]
+#gas production in thousands of cubic feet####
+
+#Adding energy data####
+#Energy per site described in Wang:
+Shale2Well_TJm<-0.015128205
+
+#Energy in MJ per meter drilled and fracked (Estimated from Wang et al:
+
+#energy in transport
+PetroleumProd_MJTKM<-1.1
+AveTravelDist_km<-20
+HeavyTruckLoad_cm<-40
+LigthTruckLoad_cm<-15
+LNGdens_KgL<-0.45
+
+#Heavy_TKM<-Heavy_Trips*AveTravelDist_km*HeavyTruckLoad_cm*1000*LNGdens_KgL/1000
+#Light_TKM<-Light_Trips*AveTravelDist_km*LigthTruckLoad_cm*1000*LNGdens_KgL/1000
+
+#described in O'Sullivan
+FlarVentPCUnder15years<-0.4
+FlarVentPCOverr15years<-0.2
+Hypercycle<-0.4
+
+
+#1.4. Calculating Economic and energy breakeven points####
+Prod_DB1.4<-Prod_DB1.3.1[with(
+  Prod_DB1.3.1, order(ï..Well_Permit_Num,Production_Period_End_Date)), ]%>%
+    mutate(Acc_Gas_Prod=ave(Gas_Quantity, ï..Well_Permit_Num, FUN=cumsum))%>%
+    mutate(Acc_Gas_Days=ave(Gas_Production_Days, ï..Well_Permit_Num, FUN=cumsum))%>%
+    mutate(Acc_Productivity = (Acc_Gas_Prod*1000)/(Acc_Gas_Days*24))%>%
+  #****Total costs are in dollars###
+  mutate(TotalCostBC = (Gas_Quantity*1000)*TotalBC) %>%
+    mutate(Acc_CostBC = ave(TotalCostBC, ï..Well_Permit_Num, FUN=cumsum))%>%
+    mutate(Acc_CostABC = (A_Total_MMS*1000000) + Acc_CostBC ) %>%
+    mutate(WellIncome = (Gas_Quantity)*Citigate)%>%
+    mutate(Acc_income = ave(WellIncome, ï..Well_Permit_Num, FUN=cumsum))%>%
+    mutate(EconBreakpoint = ifelse(Acc_income>Acc_CostABC, "Over", "Under"))%>%
+    
+#Energy ON SITE####
+   mutate(GrossExtraction_cm=Gas_Quantity*1000*Cf2cm)%>%
+   mutate(GrossExtraction_TJ=GrossExtraction_cm*cm2MJ/1000000)%>%
+   mutate(ECFix_TJ = (Depth_m+1000) * Shale2Well_TJm) %>%
+  
+   #TRANSPORT energy ####
+   mutate(GasTruck_TKM= AveTravelDist_km*(GrossExtraction_cm*1000/2)*LNGdens_KgL/1000)%>%
+   mutate(ECTransport_TJ = GasTruck_TKM*PetroleumProd_MJTKM/1000000) %>%
+
+  #LOSSES####
+    mutate(FlaVent_TJ = if_else(Age/365>=15, FlarVentPCOverr15years,FlarVentPCUnder15years)*
+             GrossExtraction_TJ)%>%
+    mutate(ECReturn_TJ = GrossExtraction_TJ * Hypercycle)%>%
+    
+    mutate (ECOper_TJ =ECTransport_TJ + FlaVent_TJ + ECReturn_TJ)%>%
+   
+   #Accumulated Energy
+   mutate(Acc_Gas_Extraction_TJ =ave(GrossExtraction_TJ, ï..Well_Permit_Num, FUN=cumsum))%>%
+     mutate(Gas_Prod_MJh = (GrossExtraction_TJ*1000000)/(Gas_Production_Days*24))%>%
+     mutate(Acc_TotalOper_TJ = ave(ECOper_TJ, ï..Well_Permit_Num, FUN=cumsum))%>%
+     mutate(Acc_TotalInput_TJ = ECFix_TJ + Acc_TotalOper_TJ ) %>%
+     mutate(EnergyBreakpoint = if_else(Acc_Gas_Extraction_TJ>Acc_TotalInput_TJ, "Over", "Under"))%>%
+    
+    #Adding waste
+    mutate (WasteBBlRate_Thbh = (Bbl*1000000)/Gas_Production_Days*24)%>%
+    mutate (WasteTonRate_Kgh = (Tons*1000)/Gas_Production_Days*24)%>%
+    mutate (AccWasteBBl = ave(Bbl, ï..Well_Permit_Num, FUN=cumsum))%>%
+    mutate (AccWasteTon = ave(Tons, ï..Well_Permit_Num, FUN=cumsum))%>%
+    mutate (AccWasteBBlRate_Thbh = (AccWasteBBl*1000000)/Acc_Gas_Days*24)%>%
+    mutate (AccWasteTonRate_Kgh = (AccWasteTon*1000)/Gas_Production_Days*24)%>%
+
+#Adding methane use data
+   mutate(Well.Phase = ifelse (Age/365<0.5, "Drilling",
+                       ifelse (Age/365<2, "Production",
+                               "Decay")))%>%
+  mutate(TotalDaysPeriod = Production_Period_End_Date-Production_Period_Start_Date)%>%
+  mutate (MethHigh_g = ifelse(Well.Phase =="Drilling", HighCompletionMethane, #completion flow
+                              ifelse(Well.Phase =="Production", 
+                                     HighUnloadingMethane*TotalDaysPeriod/7  #Weekly unloading
+                                     +HighProductionMethane *Gas_Production_Days*24*60, #production minutes
+                                     HighUnloadingMethane*5*TotalDaysPeriod/7  #Often unloading
+                                     +HighProductionMethane *Gas_Production_Days*24*60)))%>%
+  mutate (MethLow_g = ifelse(Well.Phase =="Drilling", LowCompletionMethane, #completion flow
+                             ifelse(Well.Phase =="Production", 
+                                    LowUnloadingMethane*TotalDaysPeriod/7  #Weekly unloading
+                                    +LowProductionMethane *Gas_Production_Days*24*60, #production minutes
+                                    LowUnloadingMethane*5*TotalDaysPeriod/7  #Often unloading
+                                    +LowProductionMethane *Gas_Production_Days*24*60)))
+#****estimating age of breakeven as first appearance of "Over"
+    #mutate(EconBRKP_Date = ave(WellIncome, ï..Well_Permit_Num, FUN=cumsum))              
+  
+
+Prod_DB1.4$Age[is.na(Prod_DB1.4$Age)] <- 0
+Prod_DB1.4$Acc_Productivity[is.na(Prod_DB1.4$Acc_Productivity)] <- 0
+Prod_DB1.4<-Prod_DB1.4[complete.cases(Prod_DB1.4$EnergyBreakpoint),]  
+
+
+write.csv(Prod_DB1.4, paste0(ExitDir,"/Prod_DB1.4.csv")) 
+
+
+    
+
+
+
+
+#****Plot a BREAKEVEN Plot of single wells####
+a<-ggplot(Prod_DB1.4[Prod_DB1.4$ï..Well_Permit_Num %in%
+                      c("003-22091", "003-22092", "003-21994"),])  +
+    geom_line(aes(y=Acc_CostABC/1000000, x=Age/365, 
+                  color= "Cost", group=ï..Well_Permit_Num)) +
+    geom_line(aes(y=Acc_income/1000000, x=Age/365,  
+                  color= "Income", group=ï..Well_Permit_Num)) +
+    facet_grid(ï..Well_Permit_Num ~.) +
+    xlab ("Age in years") + ylab ("Million Dollars\n") +
+    xlim(0,5) + 
+    theme_few()+
+    theme(legend.position="bottom",legend.title=element_blank())
+
+    
+
+a2<-ggplot(Prod_DB1.4[Prod_DB1.4$ï..Well_Permit_Num %in%
+                       c("003-22091", "003-22092", "003-21994"),])  +
+  geom_line(aes(y=Acc_TotalInput_TJ, x=Age/365, 
+             color= "Input", group=ï..Well_Permit_Num)) +
+  geom_line(aes(y=Acc_Gas_Extraction_TJ, x=Age/365,  
+                color= "Production", group=ï..Well_Permit_Num)) +
+  facet_grid(ï..Well_Permit_Num ~.) +
+  xlab ("Age in years") + ylab ("Megajoules\n") +
+  xlim(0,8) + 
+  theme_few()+
+  theme(legend.position="bottom",legend.title=element_blank())
+
+
+plot_grid(a,a2, labels = c('A', 'B'))
+
+ab<-Prod_DB1.4%>%
+  group_by(Age, Zone_Name)%>%
+  summarise(Prod = mean(Gas_Quantity),
+            MaxProd = max(Gas_Quantity),
+            MinProd = min(Gas_Quantity))%>%
+  ggplot( aes(x=Age/365,y=Prod *Cf2cm/1000)) +
+  geom_line (alpha = 0.7) + 
+  xlim(0,12) + ylim(0,7) + 
+  xlab ("Age") + ylab ("Million cubic meters")+
+  theme_few()+
+  theme(legend.position="bottom",legend.title=element_blank())
+
+
+ad<-Prod_DB1.4%>%
+    group_by(Age, Zone_Name)%>%
+    summarise(Prod = mean(Gas_Quantity),
+              MaxProd = max(Gas_Quantity),
+              MinProd = min(Gas_Quantity))%>%
+    ggplot( aes(x=Age/365,y=Prod *Cf2cm/1000, color=Zone_Name)) +
+    geom_line ( alpha = 0.7) +
+    geom_hline(yintercept = 2.5)+
+    facet_grid(Zone_Name ~.) +
+    xlim(0,10) + ylim(0,10) + 
+    xlab ("Age") + ylab ("Million cubic meters")+
+    theme_few()+
+    theme(legend.position="bottom",legend.title=element_blank())
+
+ac<-Prod_DB1.4%>%
+  group_by(Depth)%>%
+  summarise(Prod = mean(Gas_Quantity),
+            MaxProd = max(Gas_Quantity),
+            MinProd = min(Gas_Quantity))%>%
+  ggplot( aes(x=-Depth*feet2meter/1000)) +
+  geom_line (aes(y=Prod *Cf2cm/1000,alpha = 0.7)) + 
+  xlim(0,2) + ylim(0,7) + 
+  xlab ("Depth in Km") + ylab ("Million cubic meters")+
+  theme_few()+
+  theme(legend.position="bottom",legend.title=element_blank())
+
+plot_grid(ab,ac, labels = c('A', 'B'))
+
+
+#1.5 Breakeven Analysis by region####
+Prod_DB1.5<-Prod_DB1.4%>%
+    select(Age, A_Total_MMS, TotalCostBC, WellIncome, 
+           Zone_Name, Production_Period_End_Date,
+           ECFix_TJ,ECOper_TJ,GrossExtraction_TJ)%>%
+    mutate(HoursProd = Age*24)%>%
+    group_by(Zone_Name, Production_Period_End_Date)%>%
+    summarise(Age = mean(Age),
+              HoursProd = sum(HoursProd), 
+              A_Total_MMS = mean(A_Total_MMS), 
+              TotalCostBC = sum(TotalCostBC),
+              WellIncome = sum(WellIncome),
+              ECFix_TJ = mean(ECFix_TJ),
+               ECOper_TJ =sum(ECOper_TJ),
+              GrossExtraction_TJ =sum(GrossExtraction_TJ),
+              AccNofWells = n())
+#*****Plot B total wells and productivity####
+b<-ggplot(Prod_DB1.5)  +
+  geom_bar (aes(y=AccNofWells, x=Production_Period_End_Date, fill = Zone_Name), 
+            stat="identity", alpha=0.5)+
+  xlab ("") + ylab ("No Wells\n") +
+  theme_bw() +
+  theme(legend.position="bottom",legend.title=element_blank())
+
+b1<-ggplot(Prod_DB1.4,aes(y=Acc_Productivity*Cf2cm/1000, x=-Depth*feet2meter/1000, 
+                          color=Zone_Name))  +
+  geom_point (aes(fill = Zone_Name), alpha=0.01)+
+  geom_smooth(method=lm,se=FALSE, fullrange=F)+
+  xlab ("Depth in Km") + ylab ("Producticity rate (thousand cm/h)\n") + ylim(0,15)+
+  theme_bw() +
+  theme(legend.position="bottom",legend.title=element_blank())
+
+b2<-ggplot(Prod_DB1.4,aes(y=Acc_Productivity*Cf2cm/1000, x=Age/365, 
+                          color=Zone_Name))  +
+  geom_point (aes(fill = Zone_Name), alpha=0.02)+
+  geom_smooth(method=lm,se=FALSE, fullrange=F)+
+  xlab ("Age in years") + ylab ("Producticity rate (thousand cm/h)\n") + 
+  xlim(0,10) + ylim(0,15)+
+  theme_bw() +
+  theme(legend.position="bottom",legend.title=element_blank())
+
+
+plot_grid(b,b1,b2, labels = c('A','B', 'C'), nrow = 1)
+
+
+Prod_DB1.5<-Prod_DB1.5[with(
+    Prod_DB1.5, order(Zone_Name,Production_Period_End_Date)), ]%>%
+    mutate(NewWells = ifelse(
+        (AccNofWells - lag(AccNofWells, default = first(AccNofWells))) < 0, 0, 
+        (AccNofWells - lag(AccNofWells, default = first(AccNofWells)))))%>%   
+    mutate (TotalCostSummary = TotalCostBC +(A_Total_MMS*1000000*NewWells))%>% 
+    mutate (Acc_CostBC = ave(TotalCostBC, Zone_Name, FUN=cumsum))%>% 
+    mutate(Acc_CostABC = ave(TotalCostSummary, Zone_Name, FUN=cumsum)) %>%
+    mutate(Acc_income = ave(WellIncome, Zone_Name, FUN=cumsum))%>%
+    mutate(Acc_hours = ave(HoursProd, Zone_Name, FUN=cumsum))%>%
+    mutate(CostMR = (TotalCostBC + A_Total_MMS*1000000)/HoursProd) %>%
+    mutate(IncomeMR = (WellIncome /HoursProd)) %>%
+    mutate(AccCostMR = (Acc_CostABC /Acc_hours)) %>%
+    mutate(AccIncomeMR = (Acc_income /Acc_hours)) %>%
+  
+  #Accumulated Energy
+  mutate(Acc_Gas_Extraction_TJ =ave(GrossExtraction_TJ, Zone_Name, FUN=cumsum))%>%
+  mutate(Acc_Gas_Prod_MJh = (Acc_Gas_Extraction_TJ*1000000)/(HoursProd))%>%
+  mutate(Acc_TotalOper_TJ = ave(ECOper_TJ, Zone_Name, FUN=cumsum))%>%
+  mutate(Acc_TotalInput_TJ = ECFix_TJ + Acc_TotalOper_TJ ) 
+
+  
+
+Prod_DB1.5$Age[is.na(Prod_DB1.5$Age)] <- 0
+
+    
+#****Plot c Breakeven Plot Cost vs Income for the sector####
+
+c<-ggplot(Prod_DB1.5)  +
+  geom_line(aes(y=Acc_CostABC/1000000000, x=Production_Period_End_Date, 
+                color= "Cost", group=Zone_Name)) +
+  geom_line(aes(y=Acc_income/1000000000, x=Production_Period_End_Date,  
+                color= "Income", group=Zone_Name )) +
+  xlab ("") + ylab ("Billion Dollars\n") +
+  theme_bw() +
+  facet_grid(Zone_Name ~.)+
+  theme(legend.position=c(0.16, 0.92), legend.title=element_blank())
+
+c2<-ggplot(Prod_DB1.5)  +
+  geom_line(aes(y=Acc_TotalInput_TJ, x=Production_Period_End_Date, 
+                color= "Inputs", group=Zone_Name)) +
+  geom_line(aes(y=Acc_Gas_Extraction_TJ/1000000000, x=Production_Period_End_Date,  
+                color= "Production", group=Zone_Name )) +
+  xlab ("") + ylab ("Megajoules") +
+  theme_bw() +
+  facet_grid(Zone_Name ~.)+
+  theme(legend.position=c(0.16, 0.92), legend.title=element_blank())
+
+plot_grid(c,c2, labels = c('A', 'B'))
+
+
+#****Plot d Breakeven Plot Cost vs Income for the sector####
+d<-ggplot(Prod_DB1.5)  +
+  geom_bar (aes(y=AccNofWells, x=Production_Period_End_Date), stat="identity")+
+  facet_grid(Zone_Name ~.)+
+  xlab ("") + ylab ("No Wells\n") +
+  theme_bw() +
+  theme(legend.position="none",legend.title=element_blank())
+
+
+plot_grid(b,a, labels = c('A', 'B'))
+
+
+
+#****Plot e cost vs income total sector####
+e<-Prod_DB1.4%>%
+  group_by(Age)%>%
+  summarise(Cost = mean(Acc_CostABC/1000000),
+            #MaxCost = max(Acc_CostABC/1000000),
+            #MinCost = min(Acc_CostABC/1000000),
+            Income= mean(Acc_income/1000000))%>%
+            #MaxIncome = max(Acc_income/1000000),
+            #MinIncome = min(Acc_income/1000000))%>%
+    ggplot( aes(x=Age/365)) +
+  geom_line (aes(y=Cost, color ="Cost"),alpha = 0.7) + 
+  geom_line (aes(y=Income, color ="Income"),alpha = 0.7) + 
+  xlim(0,8) + 
+  xlab ("Age") + ylab ("Million Dollars\n")+
+  theme_few()+
+  theme(legend.position="bottom",legend.title=element_blank())
+
+
+e2<-Prod_DB1.4%>%
+  group_by(Age)%>%
+  summarise(Input = mean(Acc_TotalInput_TJ/10),
+            MaxInput = max(Acc_TotalInput_TJ/10),
+            MinInput = min(Acc_TotalInput_TJ/10),
+            Production= mean(Acc_Gas_Extraction_TJ),
+            MaxProd = max(Acc_Gas_Extraction_TJ),
+            MinProd = min(Acc_Gas_Extraction_TJ))%>%
+  ggplot( aes(x=Age/365)) +
+  geom_line (aes(y=Input, color ="Input"),alpha = 0.7) + 
+  geom_line (aes(y=Production, color ="Production"),alpha = 0.7) + 
+  xlim(0,8) + 
+  xlab ("Age") + ylab ("Megajoules")+
+  theme_few()+
+  theme(legend.position="bottom",legend.title=element_blank())
+
+e3<-Prod_DB1.4%>%
+  group_by(Depth)%>%
+  summarise(Cost = mean(Acc_CostABC/1000000),
+            MaxCost = max(Acc_CostABC/1000000),
+            MinCost = min(Acc_CostABC/1000000),
+            Income= mean(Acc_income/1000000),
+            MaxIncome = max(Acc_income/1000000),
+            MinIncome = min(Acc_income/1000000))%>%
+  ggplot( aes(x=-Depth*feet2meter/1000)) +
+  geom_line (aes(y=Cost, color ="Cost"),alpha = 0.7) + 
+  geom_line (aes(y=Income, color ="Income"),alpha = 0.7) + 
+  #xlim(0,10) + 
+  ylim(0,30)+
+  xlab ("Depth in Km") + ylab ("Million Dollars\n")+
+  theme_few()+
+  theme(legend.position="bottom",legend.title=element_blank())
+
+
+e4<-Prod_DB1.4%>%
+  group_by(Depth)%>%
+  summarise(Input = mean(Acc_TotalInput_TJ/10),
+            MaxInput = max(Acc_TotalInput_TJ/10),
+            MinInput = min(Acc_TotalInput_TJ/10),
+            Production= mean(Acc_Gas_Extraction_TJ),
+            MaxProd = max(Acc_Gas_Extraction_TJ),
+            MinProd = min(Acc_Gas_Extraction_TJ))%>%
+  ggplot( aes(x=-Depth*feet2meter/1000)) +
+  geom_line (aes(y=Input, color ="Input"),alpha = 0.7) + 
+  geom_line (aes(y=Production, color ="Production"),alpha = 0.7) + 
+  #xlim(0,8) + 
+  ylim(0,10000)+
+  xlab ("Depth in Km") + ylab ("Megajoules")+
+  theme_few()+
+  theme(legend.position="bottom",legend.title=element_blank())
+
+plot_grid(e,e2)
+plot_grid(e3,e4)
+plot_grid(e,e3,e2,e4, 
+          labels = c('A', 'B', "C", "D"),
+          ncol = 2, align = 'v')
+#****plot f gap econ energy by region by age ####
+
+f<-Prod_DB1.4%>%
+  group_by(Age, Zone_Name)%>%
+  summarise(Cost = mean(Acc_CostABC/1000000),
+            MaxCost = max(Acc_CostABC/1000000),
+            MinCost = min(Acc_CostABC/1000000),
+            Income= mean(Acc_income/1000000),
+            MaxIncome = max(Acc_income/1000000),
+            MinIncome = min(Acc_income/1000000))%>%
+  ggplot( aes(x=Age/365)) +
+  geom_line (aes(y=Cost, color ="Cost"),alpha = 0.7) + 
+  geom_line (aes(y=Income, color ="Income"),alpha = 0.7) + 
+  facet_grid(.~Zone_Name ) +
+  xlim(0,8) + 
+  xlab ("Age") + ylab ("Million Dollars")+
+  theme_few()+  
+  theme(legend.position="bottom",legend.title=element_blank())
+
+f2<-Prod_DB1.4%>%
+  group_by(Age, Zone_Name)%>%
+  summarise(Input = mean(Acc_TotalInput_TJ/10),
+            MaxInput = max(Acc_TotalInput_TJ/10),
+            MinInput = min(Acc_TotalInput_TJ/10),
+            Production= mean(Acc_Gas_Extraction_TJ),
+            MaxProd = max(Acc_Gas_Extraction_TJ),
+            MinProd = min(Acc_Gas_Extraction_TJ))%>%
+  ggplot( aes(x=Age/365)) +
+  geom_line (aes(y=Input, color ="Input"),alpha = 0.7) + 
+  geom_line (aes(y=Production, color ="Production"),alpha = 0.7) + 
+  facet_grid(.~Zone_Name ) +
+  xlim(0,8) + ylim(0,30000) + 
+  xlab ("Age") + ylab ("Megajoules")+
+  theme_few()+
+  theme(legend.position="bottom",legend.title=element_blank())
+
+plot_grid(f,f2, labels = c('A', 'B'),ncol = 1, align = 'v')
+
+#****plot g gap econ energy by region by depth ####
+
+g<-Prod_DB1.4%>%
+  group_by(Depth, Zone_Name)%>%
+  summarise(Cost = mean(Acc_CostABC/1000000),
+            MaxCost = max(Acc_CostABC/1000000),
+            MinCost = min(Acc_CostABC/1000000),
+            Income= mean(Acc_income/1000000),
+            MaxIncome = max(Acc_income/1000000),
+            MinIncome = min(Acc_income/1000000))%>%
+  ggplot( aes(x=-Depth*feet2meter/1000)) +
+  geom_line (aes(y=Cost, color ="Cost",alpha = 0.7)) + 
+  geom_line (aes(y=Income, color ="Income"),alpha = 0.7) + 
+  facet_grid(.~Zone_Name ) +
+  #xlim(0,8) + 
+  xlab ("Depth in Km") + ylab ("Million Dollars")+
+  theme_few()+  
+  theme(legend.position="bottom",legend.title=element_blank())
+g2<-Prod_DB1.4%>%
+  group_by(Depth, Zone_Name)%>%
+  summarise(Input = mean(Acc_TotalInput_TJ/10),
+            MaxInput = max(Acc_TotalInput_TJ/10),
+            MinInput = min(Acc_TotalInput_TJ/10),
+            Production= mean(Acc_Gas_Extraction_TJ),
+            MaxProd = max(Acc_Gas_Extraction_TJ),
+            MinProd = min(Acc_Gas_Extraction_TJ))%>%
+  ggplot( aes(x=-Depth*feet2meter/1000)) +
+  geom_line (aes(y=Input, color ="Input",alpha = 0.7)) + 
+  geom_line (aes(y=Production, color ="Production"),alpha = 0.7) + 
+  facet_grid(.~Zone_Name ) +
+  #xlim(0,8) + 
+  ylim(0,30000) + 
+  xlab ("Depth in Km") + ylab ("Megajoules")+
+  theme_few()+
+  theme(legend.position="bottom",legend.title=element_blank())
+
+plot_grid(g,g2, labels = c('A', 'B'),ncol = 1, align = 'v')
+
+
+#1.6 ####
+Prod_DB1.6<-Prod_DB1.4 %>%
+  select(ï..Well_Permit_Num, Zone_Name, Production_Period_End_Date, 
+          Acc_CostABC, Acc_income, EconBreakpoint,Age)%>%
+  group_by(Production_Period_End_Date, EconBreakpoint, Zone_Name)%>%
+  summarise(NoWellBP = n(), Acc_income = sum(Acc_income),
+            Acc_CostABC = sum(Acc_CostABC))
+Prod_DB1.6<-Prod_DB1.6[complete.cases(Prod_DB1.6), ]
+
+Prod_DB1.6B<-Prod_DB1.4 %>%
+  select(ï..Well_Permit_Num, Zone_Name, Production_Period_End_Date, 
+          Acc_CostABC, Acc_income, EnergyBreakpoint,Age)%>%
+  group_by(Production_Period_End_Date, EnergyBreakpoint, Zone_Name)%>%
+  summarise(NoWellBP = n())
+Prod_DB1.6B<-Prod_DB1.6B[complete.cases(Prod_DB1.6B), ]
+
+#****Plot h  breakeven wells####
+
+h<-ggplot(Prod_DB1.6, aes(Production_Period_End_Date))  +
+  geom_area(aes(y=NoWellBP, x=Production_Period_End_Date,  
+                fill= EconBreakpoint, group=EconBreakpoint),alpha = 0.7) +
+  facet_grid(Zone_Name ~.) +
+  xlab ("") + ylab ("Number of wells\n") +
+  theme_few()+
+  theme(legend.position="bottom")+
+  scale_fill_manual(values=c("cadetblue", "coral3")) 
+
+
+
+
+h2<-ggplot(Prod_DB1.6B, aes(Production_Period_End_Date))  +
+  geom_area(aes(y=NoWellBP, x=Production_Period_End_Date,  
+                fill= EnergyBreakpoint, group=EnergyBreakpoint),alpha = 0.7) +
+  facet_grid(Zone_Name ~.) +
+  xlab ("") + ylab ("Number of wells\n") +
+  theme_few()+
+  theme(legend.position="bottom")+
+  scale_fill_manual(values=c("cadetblue", "coral3")) 
+
+plot_grid(h,h2, labels = c('A', 'B'),ncol = 2, align = 'v')
+
+
+
+#****Plot i water vs energy rates####
+i<-ggplot(Prod_DB1.4,aes(y=(WasteBBlRate_Thbh*Barrel2cm/1000), x=Gas_Prod_MJh/1000, 
+                          color=Zone_Name))  +
+    geom_point (aes(fill = Zone_Name), alpha=0.1)+
+    geom_smooth(method=lm,se=FALSE, fullrange=F)+
+    xlab ("Energy rate (TJ/h)") + 
+    ylab ("Fluid Rate (Hm3/h)\n") + 
+    ylim (0,2000000) + xlim(0,1000)+
+    facet_grid(.~Zone_Name ) +
+    theme_few()  +
+    theme(legend.position="bottom",legend.title=element_blank())
+
+
+i2<-Prod_DB1.4%>%
+    group_by( Age, Depth_m)%>%
+    summarise(Waste = sum(Bbl*1000*Barrel2cm))%>%
+    ggplot( aes(x=Age/365, color=Depth_m/1000)) +
+    geom_point (aes(y=Waste), alpha = 0.3) + 
+    #xlim(0,8) + 
+    ylim(0,6000000) + xlim(0,8)+
+    xlab ("Age in years") + ylab ("Fluid production (Hm3)")+
+    theme_few()+
+    theme(legend.position="bottom",legend.title=element_blank())
+
+ggplot(Prod_DB1.4,aes(y=(WasteBBlRate_Thbh*Barrel2cm/1000), x=Gas_Prod_MJh, 
+                         color=Zone_Name))  +
+    geom_point (aes(fill = Zone_Name), alpha=0.02)+
+    geom_smooth(method=lm,se=FALSE, fullrange=F)+
+    xlab ("Accumulated energy rate (MJ/h)") + 
+    ylab ("Accumulated Fluid Rate (Hm3/h)\n") + 
+    ylim (0,2000000) + xlim(0,1000000)+
+    theme_bw()  +
+    theme(legend.position="bottom",legend.title=element_blank())
+
+
+
+
+#Analysis by period####
+
+
+Prod_DB1.5.3<-Prod_DB1.4%>%
+    select(Age, A_Total_MMS, TotalCostBC, WellIncome, 
+           Zone_Name)%>%
+    mutate(HoursProd = Age*24)%>%
+    group_by(Zone_Name)%>%
+    summarise(Age = mean(Age),
+              HoursProd = sum(HoursProd), A_Total_MMS = mean(A_Total_MMS), 
+              TotalCostBC = sum(TotalCostBC), WellIncome = sum(WellIncome),
+              AccNofWells = n())
+
+
+
+
+
+
+#analysis by regions####
+
+Prod_DB1.5.3<-Prod_DB1.5.3[with(
+    Prod_DB1.5.3, order(Zone_Name)), ]%>%
+    mutate(NewWells = ifelse(
+        (AccNofWells - lag(AccNofWells, default = first(AccNofWells))) < 0, 0, 
+        (AccNofWells - lag(AccNofWells, default = first(AccNofWells)))))%>%
+    mutate (TotalCostSummary = TotalCostBC +(A_Total_MMS*1000000*NewWells))%>% 
+    mutate (Acc_CostBC = ave(TotalCostBC, Zone_Name, FUN=cumsum))%>% 
+    mutate(Acc_CostABC = ave(TotalCostSummary, Zone_Name, FUN=cumsum)) %>%
+    mutate(Acc_income = ave(WellIncome, Zone_Name, FUN=cumsum))%>%
+    mutate(Acc_hours = ave(HoursProd, Zone_Name, FUN=cumsum))%>%
+    mutate(CostMR = (TotalCostBC + A_Total_MMS*1000000)/HoursProd) %>%
+    mutate(IncomeMR = (WellIncome /HoursProd)) %>%
+    mutate(AccCostMR = (Acc_CostABC /Acc_hours)) %>%
+    mutate(AccIncomeMR = (Acc_income /Acc_hours))%>%
+    mutate(finantial_Gap = Acc_income-Acc_CostABC)
+
+
+ggplot(Prod_DB1.5.3) + 
+    geom_area(aes(y = finantial_Gap, x = Production_Period_End_Date, 
+                  fill = "lightblue"),
+              stat="sum")
+  
+
+#plotting it####
+Prod_DB2.1<-dcast(Prod_DB2[Prod_DB2$variable=="Acc_CostABC" | 
+                             Prod_DB2$variable=="Acc_income" ,], 
+                  ï..Well_Permit_Num + Age  ~ variable, sum) 
+
+n
+
+
+
+#Plotting subsidies####
+Subs<-read.csv(paste0(ExitDir, "/Subsidies.csv"), 
+                         colClasses = c(rep("factor",3 ), "numeric"),
+                         dec = ".")
+
+
+ggplot(Subs, aes(Fuel.Cycle.Type,fill=Subsidy.Type))+
+    geom_bar()+
+    (aes(weight = DollarsSubsidy/1000000000))+
+    labs( y= "Billion Dollar"  ) +
+    theme_minimal()+
+     theme(legend.position="bottom") +
+    xlab("")
+
+
+
+
+#Barplot of distribution of wells####
+Prod_DB1.7<-Prod_DB1.4 %>%
+  select(ï..Well_Permit_Num, Zone_Name, Production_Period_End_Date, 
+          EconBreakpoint, Age)%>%
+  group_by(Production_Period_End_Date, EconBreakpoint, Zone_Name)%>%
+  summarise(NoWellBP = n())%>%
+  mutate (NoWellBPbar = if_else(EconBreakpoint=="Under",-NoWellBP,NoWellBP))
+
+ggplot(Prod_DB1.7, aes(x=Production_Period_End_Date, y=NoWellBPbar, fill=EconBreakpoint)) + 
+  geom_bar(stat="identity", width=0.25) +
+  scale_x_continuous(breaks=-5:5) +
+  scale_y_continuous(breaks=seq(-10,10,2.5), limits=c(-10,10)) +
+  theme(axis.text.x=element_text(size=14), axis.text.y=element_text(size=14), legend.text=element_text(size=14))
+
+
+
+ggplot(Prod_DB1.4, aes())  +
+  geom_bar(aes(x=Production_Period_End_Date,y=NoWellBP[Prod_DB1.6$EconBreakpoint=="Over"]),
+           fill="blue",stat="identity",position="dodge") + 
+  geom_bar(aes(x=Production_Period_End_Date,y=-NoWellBP[Prod_DB1.6$EconBreakpoint=="Under"]),
+           fill="red",stat="identity",position="dodge")
+
+  geom_bar(aes(y=NoWellBP, x=Production_Period_End_Date,  
+                fill= EconBreakpoint, group=EconBreakpoint)) +
+  facet_grid(Zone_Name ~.) +
+  xlab ("") + ylab ("Number of wells\n") +
+  theme_minimal()+
+  theme(legend.position="bottom")
+
+###calculating Ages####
+#Preparing DB to estimate well age
+UnconPriceDB<-merge(Prod_DB1, GasPrices[,c(8,10)],
+               by = "Year")%>%
+  merge(ProductivityConven,  by = "Year")%>%
+  filter(Unconventional =="Yes")%>%
+  filter(Gas_Production_Days >0)%>%
+  mutate (Unconv_ProductivityCFH = 
+            (Gas_Quantity*1000)/ (Gas_Production_Days*24)) %>%
+  mutate (Unconv_ProductivityD = Gas_Quantity/ (Gas_Production_Days)) %>% 
+  mutate (Production_Period_Start_Date = 
+            as.Date(Production_Period_Start_Date, "%m/%d/%Y")) %>%
+  mutate (Production_Period_End_Date = 
+            as.Date(Production_Period_End_Date, "%m/%d/%Y")) %>%
+  mutate (Spud_Date = as.Date(Spud_Date, "%m/%d/%Y")) %>%
+  arrange (Production_Period_End_Date,ï..Well_Permit_Num )
+
+#Ordering data before extracting first appearances
+
+
+
+
+
+Prod_DB2_Molten<-melt(Prod_DB1, id=c("ï..Well_Permit_Num","Well_County", 
+                                     "Well_Latitude", "Well_Longitude",
+                                     "Unconventional", "Well_Type", "DB_Type",
+                                     "Year", "SPUDYear"),
+                      measure.vars = c("Gas_Quantity", "Gas_Production_Days", 
+                                       "Oil_Quantity","Oil_Production_Days"))  
+
+summary(Prod_DB2_Molten)
+
+
+#plottng ####
+
+
+
+
+
+
+#Estimating Costs####
+#literature sources: 
+#Costs are defined as costs incurred to until the reporting period, 
+##according to age and total days in production
+UnconPriceDB3<-UnconPriceDB2%>%
+  mutate (income = Henry.Hub * Gas_Quantity) %>%
+  melt( id=names(UnconPriceDB2[c(1,2,4:9,16:35, 43)]),
+        measure.vars = !UnconPriceDB2[c(1,2,4:9,16:35,43)] )%>%
+
+
+
+      
+    
+UnconPriceDB2%>%
+    select(Age,Stage,Unconv_ProductivityD, Conv_ProductivityD, DB_Type )%>%
+    mutate(Stage = as.factor(Stage))%>%
+    filter (!is.na(Stage))%>%
+    ggplot(aes(y=(Unconv_ProductivityD/1000), x=Age/365)) +
+    geom_point(color="gray80")+    
+    stat_smooth(stat = 'gam')+
+    #facet_grid(rows = vars(Stage), cols = NULL, scales = "fixed",
+               #  space = "fixed", shrink = TRUE, labeller = "label_value",
+                # as.table = TRUE, switch = NULL, drop = TRUE, margins = FALSE,
+                 #facets = NULL) +
+    geom_hline(aes(yintercept =  max(Conv_ProductivityD)/1000,
+              linetype = "Max Conv Productivity"), color='grey40')+
+    scale_linetype_manual(name = "Reference", values = c(2,2), 
+                       guide = guide_legend(override.aes = list(color = "grey40")))+
+    scale_fill_brewer(palette = "Set3") +
+    xlim(0,10) + ylim(0,25) +
+    xlab ("\nAge in Years") + ylab ("Shale gas productivity (Million cf per day)\n") +
+     theme_bw()
+    
+
+
+library("Hmisc")
+res2 <- rcorr(as.matrix(GasPrices2[,2:10]))
+res2  
+
+library(corrplot)
+corrplot(res2$r, type = "upper", order = "hclust", 
+         tl.col = "black", tl.srt = 45) 
+
+
+
+
+
+
+#Associating stage by age####
+
+UnconPriceDBYear<-UnconPriceDB%>%
+    filter (DB_Type=="Year")  %>%
+    mutate (StageAge = if_else(Age<120 ,
+                               "Drilling",
+                               (if_else(Conv_ProductivityD >=Unconv_ProductivityD, 
+                                        "Decay", "Production"))))
+
+UnconPriceDBSem<-UnconPriceDB%>%
+    filter (DB_Type=="Semester")  %>%
+    mutate (StageAge = if_else(Age<120,
+                               "Drilling",
+                               (if_else(Conv_ProductivityD >=Unconv_ProductivityD, 
+                                        "Decay", "Production"))))
+UnconPriceDBMonth<-UnconPriceDB%>%
+    filter (DB_Type=="Month")  %>%
+    mutate (StageAge = if_else(Age<120,
+                               "Drilling",
+                               (if_else(Conv_ProductivityD >=Unconv_ProductivityD, 
+                                        "Decay", "Production"))))
+
+UnconPriceDB2<-rbind(UnconPriceDBYear, rbind (UnconPriceDBSem, UnconPriceDBMonth))
+
+
+#Plotting data for control####
+data1<-dcast(Prod_DB2_Molten[Prod_DB2_Molten$variable=="Gas_Quantity" | 
+                               Prod_DB2_Molten$variable=="Gas_Production_Days",], 
+             Unconventional + Year + DB_Type ~ variable, sum)%>%
+    mutate (Unconventional = as.factor(Unconventional)) %>%
+    mutate (Year = as.factor(Year))%>%
+    mutate (GasRate_cfDay = (Gas_Quantity/1000) / (Gas_Production_Days))%>%
+    mutate (GasRate_cfHour = (Gas_Quantity/1000) / (Gas_Production_Days*24))
+  
+
+data1[is.na(data1)] <- 0
+
+data2<-melt (data1,id=c("Unconventional", "Year", "DB_Type"))
+
+setwd(PicDir)
+
+tiff("ExtractionPA.tiff", units="px", width=500, height=500)
+
+ggpairs(data1[ data1$Year %in% c("1990", "1991", "1992"),], columns = 1:6, 
+        ggplot2::aes(colour=Unconventional),
+        cardinality_threshold=40)+
+  theme_few()
+
+
+
+
+ggplot(data1[ data1$Year %in% c("1990", "1991", "1992"),]) + 
+    geom_point( aes(y=Gas_Quantity/1000000, x=Year, fill=Unconventional), 
+              stat="Identity", width=0.9) +    
+    scale_fill_brewer(palette = "Set3") +
+    labs(title = "Gas extraction in PA - Annual Database" , 
+         y = "Trillion cubic feet")+
+    #scale_x_discrete("Year", 
+                   #  labels = c("1980","1985","1990","1995","2000","2005","2010","2015", "2020"), 
+                    # breaks = c("1980","1985","1990","1995","2000","2005","2010","2015", "2020")) +
+    theme(axis.title.x= element_text(size=12, 
+                                     margin = margin(t = 20, 
+                                                     r = 0 , b = 0, l = 0)),
+          axis.title.y= element_text(size=12, 
+                                     margin = margin(t = 0, 
+                                                     r = 20, b = 0, l = 0)), 
+          axis.text.x = element_text(size=10, 
+                                     margin = margin(t = 0, 
+                                                     r = 0, b = 5, l = 0)),
+          axis.text.y = element_text(size=10, 
+                                     margin = margin(t = 0, 
+                                                     r = 20, b = 0, l = 0)), 
+          legend.position = c(0.2, 0.7),
+          legend.title = element_text(size=12, 
+                                      margin = margin(t = 0, 
+                                                      r = 0, b = 0, l = 0)),
+          panel.background =element_rect(fill="white"),
+          panel.grid.major.x = element_line(colour = NA), 
+          panel.grid.major.y = element_line(colour = "grey80"),
+          panel.grid.major = element_blank(), 
+          panel.grid.minor = element_blank(),
+          plot.title = element_text(size=15, hjust = 0.5)) 
+
+dev.off()
+rm(data1)
+rm(data2)
+gc()
+
+#line, rect, text, title, aspect.ratio, axis.title, 
+#axis.title.x.top, axis.title.x.bottom, axis.title.y, axis.title.y.left,
+#axis.title.y.right, axis.text,  axis.text.x.top,
+#axis.text.x.bottom, left, axis.text.y.right,
+#axis.ticks, axis.ticks.x, axis.ticks.x.top, axis.ticks.x.bottom,
+#axis.ticks.y, axis.ticks.y.left, axis.ticks.y.right, axis.ticks.length,
+#axis.line, axis.line.x, axis.line.x.top, axis.line.x.bottom, axis.line.y,
+#axis.line.y.left, axis.line.y.right, legend.background, legend.margin,
+#legend.spacing, legend.spacing.x, legend.spacing.y, legend.key,
+#legend.key.size, legend.key.height, legend.key.width, legend.text,
+#legend.text.align,  legend.title.align, 
+#legend.direction, legend.justification, legend.box, legend.box.just,
+#legend.box.margin, legend.box.background, legend.box.spacing,
+
+
+#panel.border, panel.spacing, panel.spacing.x,
+#panel.spacing.y, panel.grid, 
+
+
+#panel.grid.minor.x, panel.grid.minor.y, 
+
+#panel.ontop =FALSE, 
+#plot.background = element_rect(fill = NA),
+
+#plot.subtitle, plot.caption, plot.tag, plot.tag.position, plot.margin,
+#strip.background= element_rect(colour = NA, fill = "white"), 
+#strip.background.x, strip.background.y,
+#strip.placement, 
+
+#strip.text = c("Gas Production in Billion cf", "Million days of Production"),
+#strip.text.x = "Test2", strip.text.y = "Test1",
+#strip.switch.pad.grid, strip.switch.pad.wrap)
+
+
+
+
+#Casting DBs for maps####
+GasProd<-dcast(Temp2[Temp2$variable=="Gas_Quantity",], 
+                    ï..Well_Permit_Num + Well_Latitude + Well_Longitude  ~ Year, sum)
+GasDays<-dcast(Temp2[Temp2$variable=="Gas_Production_Days",], 
+                    ï..Well_Permit_Num + Well_Latitude + Well_Longitude  ~ Year, sum)
+OilProd<-dcast(Temp2[Temp2$variable=="Oil_Quantity",], 
+                    ï..Well_Permit_Num + Well_Latitude + Well_Longitude  ~ Year, sum)
+OilDays<-dcast(Temp2[Temp2$variable=="Oil_Production_Days",], 
+                    ï..Well_Permit_Num + Well_Latitude + Well_Longitude  ~ Year, sum)
+
+
+#Calculating gas rate####
+
+GasRateDummy<-dcast(Temp2[Temp2$variable=="Gas_Quantity" | Temp2$variable=="Gas_Production_Days",], 
+    ï..Well_Permit_Num + Well_Latitude + Well_Longitude + Year  ~ variable, sum)%>%
+    mutate (GasRate = (Gas_Quantity) / (Gas_Production_Days*24))
+    
+
+    GasRateDummy[is.na(GasRateDummy)] <- 0
+
+GasRate<-melt (GasRateDummy[,-5:-6],
+                id=c("ï..Well_Permit_Num", "Well_Latitude", "Well_Longitude","Year"))%>%
+        dcast (ï..Well_Permit_Num + Well_Latitude + Well_Longitude  ~ Year, sum)
+
+sum(GasRateDummy$Gas_Quantity)
+sum(Temp1$Gas_Quantity)
+
+rm(GasRateDummy)
+gc()
+    
+#Calculating Oil Rate####
+OilRateDummy<-dcast(Temp2[Temp2$variable=="Oil_Quantity" | Temp2$variable=="Oil_Production_Days",], 
+                    ï..Well_Permit_Num + Well_Latitude + Well_Longitude + Year  ~ variable, sum)%>%
+    mutate (OilRate = (Oil_Quantity) / (Oil_Production_Days*24))
+
+
+OilRateDummy[is.na(OilRateDummy)] <- 0
+
+OilRate<-melt (OilRateDummy[,-5:-6],
+               id=c("ï..Well_Permit_Num", "Well_Latitude", "Well_Longitude","Year"))%>%
+    dcast (ï..Well_Permit_Num + Well_Latitude + Well_Longitude  ~ Year, sum)
+
+sum(OilRateDummy$Gas_Quantity)
+sum(Temp1$Gas_Quantity)
+    
+    dcast(Temp2[Temp2$variable=="GasRate",], 
+                        ï..Well_Permit_Num + Well_Latitude + Well_Longitude  ~ Year, sum)
+OilRate<-dcast(Temp2[Temp2$variable=="OilRate",], 
+                        ï..Well_Permit_Num + Well_Latitude + Well_Longitude  ~ Year, sum)
+
+rm(OilRateDummy)
+gc()
+
+
+
+
+#comprobacion de cantidad total de gas se conserva####
+SumgasQtTemp1<-sum(Temp1$Gas_Quantity)
+SumgasDayTemp1<-sum(Temp1$Gas_Production_Days)
+SumOilQtTemp1<-sum(Temp1$Oil_Quantity)
+SumOilDayTemp1<-sum(Temp1$Oil_Production_Days)
+
+
+SumgasQtTemp2<-sum(GasProd[,4:41])
+SumgasDayTemp2<-sum(GasDays[,4:41])
+SumOilQtTemp2<-sum(OilProd[,4:41])
+SumOilDayTemp2<-sum(OilDays[,4:41])
+SumGasrateTemp2<-sum(GasRate[,4:41])
+SumOilrateTemp2<-sum(OilRate[,4:41])
+
+SumgasQtTemp1
+SumgasQtTemp2
+SumgasDayTemp1
+SumgasDayTemp2
+SumOilQtTemp1
+SumOilQtTemp2
+SumOilDayTemp1
+SumOilDayTemp2
+SumGasrateTemp1
+SumGasrateTemp2
+SumOilrateTemp1
+SumOilrateTemp2
+
+
+
+
+#guardando BDs####
+setwd(ExitDir)
+if(SumgasQtTemp1==SumgasQtTemp2)
+  write.csv(GasProd, paste0(ExitDir,"/GasProd_Year.csv")) else
+    message("Records do not macth ")
+if(SumgasDayTemp1==SumgasDayTemp2)
+  write.csv(GasDays, paste0(ExitDir,"/GasDays_Year.csv")) else
+    message("Records do not macth ")
+if(SumOilQtTemp1==SumOilQtTemp2)
+  write.csv(OilProd, paste0(ExitDir,"/OilProd_Year.csv")) else
+    message("Records do not macth ")
+if(SumOilDayTemp1==SumOilDayTemp2)
+  write.csv(OilDays, paste0(ExitDir,"/OilDays_Year.csv")) else
+    message("Records do not macth ")
+
+write.csv(GasRate, paste0(ExitDir,"/GasRate_Year.csv"))
+write.csv(OilRate, paste0(ExitDir,"/OilRate_Year.csv"))
+
+rm(SumgasQtTemp1)
+rm(SumgasQtTemp2)
+rm(SumgasDayTemp1)
+rm(SumgasDayTemp2)
+rm(SumOilQtTemp1)
+rm(SumOilQtTemp2)
+rm(SumOilDayTemp1)
+rm(SumOilDayTemp2)
+rm(Temp1)
+rm(Temp2)
+rm(GasDays)
+rm(GasProd)
+rm(GasRate)
+rm(OilDays)
+rm(OilRate)
+rm(OilProd)
+rm(Prod_DB)
+rm(InDir)
+
+gc()
+gc()
+gc()
+
+
+
+#check of duplicates in 1991####
+Prod_DB[Prod_DB$ï..Well_Permit_Num == "005-20580" & 
+          Prod_DB$Reporting_Period =="Jan - Dec 1970 (Annual O&G)" ,]
+
+Periods<-levels(as.factor(Prod_DB$Reporting_Period))
+
+MunicSupli<-levels(as.factor(Prod_DB$Well_Municipality[which(
+  Prod_DB$ï..Well_Permit_Num %in%  DupliLevels & 
+    Prod_DB$Reporting_Period =="Jan - Dec 1991 (Annual O&G)") ]))%>%
+  
+  
+  TableDuplis<-Prod_DB %>%
+  filter(ï..Well_Permit_Num %in%  DupliLevels)%>%
+  filter(Reporting_Period =="Jan - Dec 1991 (Annual O&G)")%>%
+  mutate(NumDuplis = 1)%>%
+  group_by(ï..Well_Permit_Num,Well_Municipality, Well_County, 
+            OGO_Num, Gas_Quantity, Gas_Production_Days)%>%
+  summarize(NumDuplis = n())%>% 
+  arrange(desc(NumDuplis))
+
+DuplisCounty<-TableDuplis%>%
+  group_by(Well_County)%>%
+  summarize(NumDuplis = n()/2)%>% 
+  arrange(desc(NumDuplis))
+
+DuplisOGO<-TableDuplis%>%
+  group_by(OGO_Num)%>%
+  summarize(NumDuplis = as.numeric(n()))%>% 
+  arrange(desc(NumDuplis))
+
+
+DuplisWell<-TableDuplis%>%
+  group_by(ï..Well_Permit_Num,OGO_Num)%>%
+  summarize(NumDuplis =as.numeric(n()))%>% 
+  arrange(desc(NumDuplis))
+
+
+ID1991<-Prod_DB
+
+
+D1991<-levels(as.factor(
+  Prod_DB$ï..Well_Permit_Num[ 
+    Prod_DB$Reporting_Period =="Jan - Dec 1991 (Annual O&G)" ]))
+
+Dupli<-ID1991[which(duplicated(ID1991))]
+DupliLevels<-levels(as.factor(Dupli))
+
+write.csv(TableDuplis[,-7], paste0(ExitDir,"/Duplis1991.csv"))
+write.csv(DuplisCounty, paste0(ExitDir,"/Duplis1991County.csv"))
+
+
+rm(DuplisCounty)
+rm(DuplisOGO)
+rm(DuplisWell)
+rm(TableDuplis)
+gc()
+gc()
+
+#Exploring the data on prices####
+GasPrices2<-GasPrices%>%
+  filter(Date %in% c("2000","2001","2002","2003","2004","2005","2006",
+                     "2007","2008","2009","2010","2011","2012","2013",
+                     "2014","2015","2016","2017","2018") )%>%
+  mutate (Date =  as.factor(lubridate::year(as.Date(Date, "%Y"))))
+
+
+ggpairs(GasPrices2,
+        cardinality_threshold=20)
+
+library("Hmisc")
+res2 <- rcorr(as.matrix(GasPrices2[,2:10]))
+res2  
+
+library(corrplot)
+corrplot(res2$r, type = "upper", order = "hclust", 
+         tl.col = "black", tl.srt = 45) 
